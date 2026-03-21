@@ -1,12 +1,11 @@
 const https = require("https");
 const http = require("http");
 const fs = require("fs");
-const crypto = require("crypto");
 const zlib = require("zlib");
 
 const LISTINGS_URL =
-	"https://www.nepremicnine.net/oglasi-oddaja/podravska/maribor/kosaki,maribor,mb-center,koroska-vrata/stanovanje/velikost-od-50-do-100-m2/";
-const SEEN_FILE = "seen_listings-nepremicnine.json";
+	"https://www.bolha.com/oddaja-stanovanja?geo[locationIds]=27056,40950,27052";
+const SEEN_FILE = "seen_listings-bolha.json";
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
 const HEADERS = {
@@ -36,7 +35,6 @@ function fetchUrl(url, redirectCount = 0) {
 				return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
 			}
 
-			// Decompress if needed
 			const encoding = res.headers["content-encoding"];
 			let stream = res;
 			if (encoding === "gzip") stream = res.pipe(zlib.createGunzip());
@@ -70,64 +68,51 @@ function stripTags(html) {
 function parseListings(html) {
 	const listings = [];
 
-	// Split on mainEntityOfPage — appears exactly once per listing
-	const chunks = html.split('<meta itemprop="mainEntityOfPage"');
+	// Split on each regular listing item
+	const chunks = html.split(/EntityList-item--Regular[^>]*data-href=/);
 
-	// First chunk is the page header — skip it
+	// First chunk is page header — skip it
 	for (let i = 1; i < chunks.length; i++) {
 		const block = chunks[i];
 		try {
-			// Canonical listing URL
-			const canonicalMatch = block.match(/content="(https:\/\/www\.nepremicnine\.net\/oglasi-oddaja\/[^"]+)"/);
-			if (!canonicalMatch) continue;
-			const listingUrl = canonicalMatch[1];
+			// Numeric ID
+			const idMatch = block.match(/"id":(\d+)/);
+			if (!idMatch) continue;
+			const id = idMatch[1];
 
-			// Numeric listing ID from URL slug (e.g. _7273119)
-			const idMatch = listingUrl.match(/_(\d+)\//);
-			const id = idMatch ? idMatch[1] : crypto.createHash("md5").update(listingUrl).digest("hex");
+			// Listing URL
+			const hrefMatch = block.match(/"(\/nepremicnine\/[^"]+)"/);
+			const path = hrefMatch ? hrefMatch[1] : null;
+			if (!path) continue;
+			const listingUrl = `https://www.bolha.com${path}`;
 
-			// Title from <h2> inside .url-title-d anchor
-			const titleMatch = block.match(/class="url-title-d"[^>]*>\s*<h2>([\s\S]*?)<\/h2>/);
-			const title = titleMatch ? stripTags(titleMatch[1]) : "N/A";
+			// Title
+			const titleMatch = block.match(/class="link" href="[^"]+">([^<]+)<\/a><\/h3>/);
+			const title = titleMatch ? titleMatch[1].trim() : "N/A";
 
-			// Room type e.g. "2-sobno"
-			const tipiMatch = block.match(/<span class="tipi">([\s\S]*?)<\/span>/);
-			const tipi = tipiMatch ? stripTags(tipiMatch[1]) : "";
+			// Image (src starts with //)
+			const imgMatch = block.match(/src="(\/\/www\.bolha\.com\/image[^"]+)"/);
+			const image = imgMatch ? `https:${imgMatch[1]}` : null;
 
-			// "Novo" badge
-			const isNew = /label-new/.test(block);
-
-			// Short description
-			const descMatch = block.match(/itemprop="description">([\s\S]*?)<\/p>/);
+			// Description block
+			const descMatch = block.match(/entity-description-main">([\s\S]*?)<\/div>/);
 			const description = descMatch ? stripTags(descMatch[1]) : "";
 
-			// Price from <h6>
-			const priceMatch = block.match(/<h6[^>]*>([\s\S]*?)<\/h6>/);
-			const price = priceMatch
-				? stripTags(priceMatch[1]).replace(/&euro;/g, "€").split(/\s{2,}/)[0].trim()
-				: "N/A";
+			// Location — text after "Lokacija: " caption
+			const locMatch = block.match(/entity-description-itemCaption">Lokacija: <\/span>([^<]+)/);
+			const location = locMatch ? locMatch[1].trim() : "N/A";
 
-			// Size (m²) — li containing velikost.svg
-			const sizeMatch = block.match(/velikost\.svg[^>]*>([^<]+)/);
-			const size = sizeMatch ? sizeMatch[1].trim() + "²" : "N/A";
+			// Price — first price only (handles crossed-out old prices)
+			const priceMatch = block.match(/class="price[^"]*">\s*([^<]+?)\s*<\/strong>/);
+			const price = priceMatch ? priceMatch[1].trim() : "N/A";
 
-			// Year built — li containing leto.svg
-			const yearMatch = block.match(/leto\.svg[^>]*>([^<]+)/);
-			const year = yearMatch ? yearMatch[1].trim() : "";
+			// Published date
+			const dateMatch = block.match(/datetime="([^"]+)"/);
+			const published = dateMatch
+				? new Date(dateMatch[1]).toLocaleDateString("sl-SI")
+				: "";
 
-			// Floor — li containing nadstropje.svg
-			const floorMatch = block.match(/nadstropje\.svg[^>]*>([^<]+)/);
-			const floor = floorMatch ? floorMatch[1].trim() : "";
-
-			// Image (lazy-loaded, stored in data-src)
-			const imgMatch = block.match(/data-src="(https:\/\/img\.nepremicnine\.net[^"]+)"/);
-			const image = imgMatch ? imgMatch[1] : null;
-
-			// Seller name
-			const sellerMatch = block.match(/itemprop="name" content="([^"]+)"/);
-			const seller = sellerMatch ? sellerMatch[1] : "";
-
-			listings.push({ id, title, tipi, isNew, description, price, size, year, floor, seller, url: listingUrl, image });
+			listings.push({ id, title, description, location, price, published, url: listingUrl, image });
 		} catch (e) {
 			console.error("Error parsing listing block:", e.message);
 		}
@@ -136,34 +121,37 @@ function parseListings(html) {
 	return listings;
 }
 
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function postToDiscord(listing) {
 	return new Promise((resolve, reject) => {
 		const now = new Date();
 
 		const fields = [
 			{ name: "💰 Cena", value: listing.price || "N/A", inline: true },
-			{ name: "📐 Velikost", value: listing.size || "N/A", inline: true },
+			{ name: "📍 Lokacija", value: listing.location || "N/A", inline: true },
 		];
-		if (listing.tipi)   fields.push({ name: "🛏️ Tip",         value: listing.tipi,  inline: true });
-		if (listing.year)   fields.push({ name: "🏗️ Leto",        value: listing.year,  inline: true });
-		if (listing.floor)  fields.push({ name: "🏢 Nadstropje",  value: listing.floor, inline: true });
-		if (listing.seller) fields.push({ name: "👤 Ponudnik",    value: listing.seller,inline: true });
+		if (listing.published) {
+			fields.push({ name: "📅 Objavljeno", value: listing.published, inline: true });
+		}
 
 		const embed = {
-			title: `${listing.isNew ? "🆕 " : ""}${listing.title}`,
+			title: listing.title,
 			url: listing.url,
 			description: listing.description || undefined,
-			color: listing.isNew ? 0xe74c3c : 0x2ecc71,
+			color: 0x2ecc71,
 			fields,
 			footer: {
-				text: `Nepremicnine.net • ${now.toLocaleDateString("sl-SI")} ${now.toLocaleTimeString("sl-SI", { hour: "2-digit", minute: "2-digit" })}`,
+				text: `Bolha.com • ${now.toLocaleDateString("sl-SI")} ${now.toLocaleTimeString("sl-SI", { hour: "2-digit", minute: "2-digit" })}`,
 			},
 			timestamp: now.toISOString(),
 		};
 
 		if (listing.image) embed.thumbnail = { url: listing.image };
 
-		const body = JSON.stringify({ username: "🏠 Nepremičnine Bot", embeds: [embed] });
+		const body = JSON.stringify({ username: "🏠 Bolha Bot", embeds: [embed] });
 
 		const webhookUrl = new URL(DISCORD_WEBHOOK_URL);
 		const options = {
@@ -210,16 +198,11 @@ async function main() {
 	for (const listing of newListings) {
 		await postToDiscord(listing);
 		seen.add(listing.id);
-		await sleep(2000); // wait 2 seconds between each post
+		await sleep(2000);
 	}
 
 	saveSeen(seen);
 	console.log("Done.");
-}
-
-// Add this helper function:
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 main().catch((err) => {
