@@ -24,7 +24,7 @@ jobs:
       - name: Run scraper
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: node scrape.js
+        run: node nepremicnine.js
 
       - name: Commit updated seen_listings.json
         run: |
