@@ -22,6 +22,9 @@ const HEADERS = {
 	"Sec-Fetch-Site": "none",
 	"Sec-Fetch-User": "?1",
 	"Cache-Control": "max-age=0",
+	"DNT": "1",
+	"Referer": "https://www.google.com/",
+	"Pragma": "no-cache",
 };
 
 function fetchUrl(url, redirectCount = 0) {
